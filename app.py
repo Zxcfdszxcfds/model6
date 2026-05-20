@@ -1,178 +1,197 @@
-
 import streamlit as st
-from transformers import pipeline
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms, models
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, maskrcnn_resnet50_fpn
+from torchvision.models.segmentation import fcn_resnet50
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+import io
 
-# ---------------------- 页面配置 ----------------------
-st.set_page_config(
-    page_title="机器翻译对比与评测系统",
-    page_icon="🌐",
-    layout="wide"
-)
+# ---------------------- 配置 ----------------------
+st.set_page_config(page_title="计算机视觉三大任务对比平台", layout="wide")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ---------------------- 数据与模型加载 ----------------------
+@st.cache_resource
+def load_models():
+    # 1. FCN 语义分割模型
+    fcn = fcn_resnet50(pretrained=True).to(device).eval()
+    # 2. Faster R-CNN 目标检测模型
+    faster_rcnn = fasterrcnn_resnet50_fpn(pretrained=True).to(device).eval()
+    # 3. Mask R-CNN 实例分割模型
+    mask_rcnn = maskrcnn_resnet50_fpn(pretrained=True).to(device).eval()
+    return fcn, faster_rcnn, mask_rcnn
 
-# ---------------------- 缓存模型加载 ----------------------
-@st.cache_resource(show_spinner="正在加载翻译模型...")
-def load_translator():
-    """加载 Hugging Face 的英译中模型"""
-    translator = pipeline(
-        "translation_en_to_zh",
-        model="Helsinki-NLP/opus-mt-en-zh",
-        device=-1  # 使用 CPU，避免无 GPU 报错
-    )
-    return translator
+fcn, faster_rcnn, mask_rcnn = load_models()
 
-
-translator = load_translator()
-
-# ---------------------- 基于规则的翻译词典 ----------------------
-# 基础英中词典，模拟早期机器翻译
-basic_dict = {
-    "I": "我",
-    "you": "你",
-    "he": "他",
-    "she": "她",
-    "it": "它",
-    "we": "我们",
-    "they": "他们",
-    "am": "是",
-    "is": "是",
-    "are": "是",
-    "was": "是",
-    "were": "是",
-    "have": "有",
-    "has": "有",
-    "do": "做",
-    "does": "做",
-    "did": "做",
-    "go": "去",
-    "went": "去",
-    "eat": "吃",
-    "ate": "吃",
-    "drink": "喝",
-    "drank": "喝",
-    "run": "跑",
-    "ran": "跑",
-    "walk": "走",
-    "walked": "走",
-    "like": "喜欢",
-    "likes": "喜欢",
-    "love": "爱",
-    "loves": "爱",
-    "cat": "猫",
-    "dog": "狗",
-    "rain": "下雨",
-    "cats": "猫",
-    "dogs": "狗",
-    "raining": "下雨",
-    "raining cats and dogs": "下猫下狗"  # 俚语的逐词保留
-}
-
-
-def rule_based_translate(sentence: str) -> str:
-    """基于词典的逐词直译"""
-    words = sentence.strip().split()
-    translated = []
-    for word in words:
-        # 处理标点
-        clean_word = word.strip(".,!?").lower()
-        if clean_word in basic_dict:
-            translated.append(basic_dict[clean_word])
-        else:
-            # 不在词典里的词直接保留
-            translated.append(word)
-    return " ".join(translated)
-
-
-# ---------------------- 页面内容 ----------------------
-st.title("🌐 机器翻译对比与评测系统")
-st.markdown("---")
-
-# 分三个模块的 Tab
-tab1, tab2, tab3 = st.tabs([
-    "模块1：神经机器翻译引擎",
-    "模块2：直译 vs. 意译对比",
-    "模块3：BLEU 自动评测"
+# 预处理
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# ---------------------- 模块1：神经机器翻译引擎 ----------------------
-with tab1:
-    st.header("🧠 神经机器翻译引擎 (NMT Engine)")
-    st.markdown("输入英文句子，体验基于 Transformer 的英译中效果。")
+# 语义分割颜色映射（简化版）
+def get_segmentation_colors():
+    return np.array([
+        [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0], [0, 0, 128],
+        [128, 0, 128], [0, 128, 128], [128, 128, 128], [64, 0, 0], [192, 0, 0]
+    ], dtype=np.uint8)
 
-    # 输入框
-    en_text = st.text_area(
-        "请输入英文句子：",
-        value="It rains cats and dogs.",
-        height=150
-    )
+colors = get_segmentation_colors()
 
-    if st.button("开始翻译", key="btn1"):
-        with st.spinner("模型正在翻译中..."):
-            # 调用翻译模型
-            result = translator(en_text)[0]["translation_text"]
-            st.success("翻译完成！")
-            st.subheader("译文结果：")
-            st.info(result)
+# ---------------------- 模块1：FCN 语义分割 ----------------------
+def run_fcn(image_tensor):
+    with torch.no_grad():
+        output = fcn(image_tensor)['out']
+        pred = torch.argmax(output, dim=1).squeeze().cpu().numpy()
+        color_pred = colors[pred]
+    return color_pred
 
-# ---------------------- 模块2：直译 vs. 意译对比 ----------------------
-with tab2:
-    st.header("⚖️ 基于规则的直译 vs. 神经网络意译")
-    st.markdown("对比两种翻译范式的差异，观察基于规则翻译的局限性。")
+# ---------------------- 模块2：Faster R-CNN 目标检测 ----------------------
+def run_faster_rcnn(image_tensor, threshold=0.5):
+    with torch.no_grad():
+        predictions = faster_rcnn(image_tensor)
+    boxes = predictions[0]['boxes'].cpu().numpy()
+    scores = predictions[0]['scores'].cpu().numpy()
+    labels = predictions[0]['labels'].cpu().numpy()
+    # 过滤低置信度检测结果
+    keep = scores >= threshold
+    return boxes[keep], scores[keep], labels[keep]
 
-    # 输入框
-    en_text2 = st.text_area(
-        "请输入英文句子：",
-        value="It rains cats and dogs.",
-        height=150
-    )
+def draw_detections(image, boxes, scores, labels):
+    image = image.copy()
+    for box, score, label in zip(boxes, scores, labels):
+        x1, y1, x2, y2 = box.astype(int)
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(image, f"{label}: {score:.2f}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    return image
 
-    if st.button("开始对比", key="btn2"):
-        with st.spinner("正在对比两种翻译结果..."):
-            # 1. 基于规则的直译
-            rule_trans = rule_based_translate(en_text2)
-            # 2. 神经机器翻译
-            nmt_trans = translator(en_text2)[0]["translation_text"]
+# ---------------------- 模块3：Mask R-CNN 实例分割 ----------------------
+def run_mask_rcnn(image_tensor, threshold=0.5):
+    with torch.no_grad():
+        predictions = mask_rcnn(image_tensor)
+    boxes = predictions[0]['boxes'].cpu().numpy()
+    scores = predictions[0]['scores'].cpu().numpy()
+    labels = predictions[0]['labels'].cpu().numpy()
+    masks = predictions[0]['masks'].cpu().numpy().squeeze(1)
+    # 过滤低置信度结果
+    keep = scores >= threshold
+    return boxes[keep], scores[keep], labels[keep], masks[keep]
 
-            # 并排展示
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader("基于规则的直译")
-                st.warning(rule_trans)
-            with col2:
-                st.subheader("神经网络意译")
-                st.success(nmt_trans)
+def draw_masks(image, masks):
+    image = image.copy()
+    for mask in masks:
+        mask = (mask > 0.5).astype(np.uint8) * 255
+        color = np.random.randint(0, 255, 3, dtype=np.uint8)
+        image[mask > 0] = image[mask > 0] * 0.5 + color * 0.5
+    return image
 
-# ---------------------- 模块3：BLEU 自动评测 ----------------------
-with tab3:
-    st.header("📊 机器翻译质量自动评测 (BLEU Score)")
-    st.markdown("输入待评测译文和参考译文，自动计算 BLEU 分数（0~1，越高越接近参考译文）。")
+# ---------------------- Streamlit界面 ----------------------
+st.title("🖼️ 计算机视觉三大任务对比平台")
+tab1, tab2, tab3, tab4 = st.tabs([
+    "1. FCN 语义分割",
+    "2. Faster R-CNN 目标检测",
+    "3. Mask R-CNN 实例分割",
+    "4. 方法对比与性能分析"
+])
 
-    # 输入框
-    candidate_text = st.text_area("待评测译文（如 NMT 或直译结果）：", height=100)
-    reference_text = st.text_area("参考译文（人工翻译或标准译文）：", height=100)
+# ---------------------- 通用上传组件 ----------------------
+uploaded_file = st.file_uploader("上传一张图片", type=["jpg", "png"], key="main_upload")
+if uploaded_file is not None:
+    image = Image.open(uploaded_file).convert("RGB")
+    image_np = np.array(image)
+    image_tensor = transform(image).unsqueeze(0).to(device)
 
-    if st.button("计算 BLEU 分数", key="btn3"):
-        if not candidate_text or not reference_text:
-            st.error("请输入待评测译文和参考译文！")
-        else:
-            # 分词
-            candidate = candidate_text.split()
-            reference = [reference_text.split()]  # 参考译文需要是列表的列表
+    # ---------------------- 模块1：FCN 语义分割 ----------------------
+    with tab1:
+        st.header("FCN 语义分割")
+        if st.button("运行FCN分割", key="run_fcn"):
+            with st.spinner("分割中..."):
+                seg_result = run_fcn(image_tensor)
+            fig, axes = plt.subplots(1, 2, figsize=(12,6))
+            axes[0].imshow(image_np)
+            axes[0].set_title("原图")
+            axes[0].axis('off')
+            axes[1].imshow(seg_result)
+            axes[1].set_title("FCN语义分割结果")
+            axes[1].axis('off')
+            st.pyplot(fig)
 
-            # 计算 BLEU，带平滑函数避免零分
-            smoothie = SmoothingFunction().method4
-            bleu_score = sentence_bleu(reference, candidate, smoothing_function=smoothie)
+    # ---------------------- 模块2：Faster R-CNN 目标检测 ----------------------
+    with tab2:
+        st.header("Faster R-CNN 目标检测")
+        threshold = st.slider("置信度阈值", 0.1, 0.9, 0.5, 0.1, key="det_thresh")
+        if st.button("运行目标检测", key="run_det"):
+            with st.spinner("检测中..."):
+                boxes, scores, labels = run_faster_rcnn(image_tensor, threshold)
+                # 绘制检测框
+                det_result = draw_detections(image_np.copy(), boxes, scores, labels)
+            fig, axes = plt.subplots(1, 2, figsize=(12,6))
+            axes[0].imshow(image_np)
+            axes[0].set_title("原图")
+            axes[0].axis('off')
+            axes[1].imshow(det_result)
+            axes[1].set_title("Faster R-CNN检测结果")
+            axes[1].axis('off')
+            st.pyplot(fig)
 
-            st.success(f"BLEU 分数：{bleu_score:.4f}")
-            # 解释分数
-            if bleu_score >= 0.7:
-                st.info("✅ 译文质量优秀，与参考译文高度匹配")
-            elif bleu_score >= 0.4:
-                st.info("⚠️ 译文质量中等，部分内容与参考译文有差异")
-            else:
-                st.warning("❌ 译文质量较差，与参考译文差异较大")
+    # ---------------------- 模块3：Mask R-CNN 实例分割 ----------------------
+    with tab3:
+        st.header("Mask R-CNN 实例分割")
+        threshold_mask = st.slider("置信度阈值", 0.1, 0.9, 0.5, 0.1, key="mask_thresh")
+        if st.button("运行实例分割", key="run_mask"):
+            with st.spinner("分割中..."):
+                boxes, scores, labels, masks = run_mask_rcnn(image_tensor, threshold_mask)
+                mask_result = draw_masks(image_np.copy(), masks)
+            fig, axes = plt.subplots(1, 2, figsize=(12,6))
+            axes[0].imshow(image_np)
+            axes[0].set_title("原图")
+            axes[0].axis('off')
+            axes[1].imshow(mask_result)
+            axes[1].set_title("Mask R-CNN实例分割结果")
+            axes[1].axis('off')
+            st.pyplot(fig)
 
-# ---------------------- 页脚 ----------------------
+    # ---------------------- 模块4：方法对比 ----------------------
+    with tab4:
+        st.header("三大方法对比与性能分析")
+        st.subheader("1. 结果对比")
+        if st.button("一键运行所有方法并对比", key="run_all"):
+            with st.spinner("运行中..."):
+                # 同时运行三个模型
+                seg_result = run_fcn(image_tensor)
+                boxes, scores, labels = run_faster_rcnn(image_tensor, 0.5)
+                det_result = draw_detections(image_np.copy(), boxes, scores, labels)
+                boxes_mask, scores_mask, labels_mask, masks = run_mask_rcnn(image_tensor, 0.5)
+                mask_result = draw_masks(image_np.copy(), masks)
+            
+            fig, axes = plt.subplots(1, 4, figsize=(20,5))
+            axes[0].imshow(image_np)
+            axes[0].set_title("原图")
+            axes[0].axis('off')
+            axes[1].imshow(seg_result)
+            axes[1].set_title("FCN语义分割")
+            axes[1].axis('off')
+            axes[2].imshow(det_result)
+            axes[2].set_title("Faster R-CNN目标检测")
+            axes[2].axis('off')
+            axes[3].imshow(mask_result)
+            axes[3].set_title("Mask R-CNN实例分割")
+            axes[3].axis('off')
+            st.pyplot(fig)
+        
+        st.subheader("2. 方法特性对比")
+        st.markdown("""
+        | 方法 | 任务类型 | 输出结果 | 优势 | 劣势 |
+        |------|----------|----------|------|------|
+        | FCN | 语义分割 | 每个像素的类别 | 全局上下文信息，分割边界平滑 | 无法区分同一类别的不同个体 |
+        | Faster R-CNN | 目标检测 | 物体边界框+类别 | 速度快，适合目标定位 | 无法输出像素级分割结果 |
+        | Mask R-CNN | 实例分割 | 物体边界框+类别+像素级掩码 | 同时完成检测与分割，能区分个体 | 模型复杂，推理速度较慢 |
+        """)
+
 st.markdown("---")
-st.markdown("© 2025 NLP 课程 Week 9 实验 | 机器翻译对比与评测系统")
+st.caption("模式识别与图像处理 - A6 计算机视觉三大任务对比实验")
