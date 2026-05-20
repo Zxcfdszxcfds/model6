@@ -1,29 +1,25 @@
 import streamlit as st
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, models
-from torchvision.models.detection import fasterrcnn_resnet50_fpn, maskrcnn_resnet50_fpn
+from torchvision import transforms, models
 from torchvision.models.segmentation import fcn_resnet50
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, maskrcnn_resnet50_fpn
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
-import io
 
-# ---------------------- 配置 ----------------------
+# ---------------------- 配置与缓存 ----------------------
 st.set_page_config(page_title="计算机视觉三大任务对比平台", layout="wide")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---------------------- 数据与模型加载 ----------------------
 @st.cache_resource
 def load_models():
     # 1. FCN 语义分割模型
-    fcn = fcn_resnet50(pretrained=True).to(device).eval()
+    fcn = fcn_resnet50(weights=models.segmentation.FCN_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1).to(device).eval()
     # 2. Faster R-CNN 目标检测模型
-    faster_rcnn = fasterrcnn_resnet50_fpn(pretrained=True).to(device).eval()
+    faster_rcnn = fasterrcnn_resnet50_fpn(weights=models.detection.FasterRCNN_ResNet50_FPN_Weights.COCO_V1).to(device).eval()
     # 3. Mask R-CNN 实例分割模型
-    mask_rcnn = maskrcnn_resnet50_fpn(pretrained=True).to(device).eval()
+    mask_rcnn = maskrcnn_resnet50_fpn(weights=models.detection.MaskRCNN_ResNet50_FPN_Weights.COCO_V1).to(device).eval()
     return fcn, faster_rcnn, mask_rcnn
 
 fcn, faster_rcnn, mask_rcnn = load_models()
@@ -58,17 +54,8 @@ def run_faster_rcnn(image_tensor, threshold=0.5):
     boxes = predictions[0]['boxes'].cpu().numpy()
     scores = predictions[0]['scores'].cpu().numpy()
     labels = predictions[0]['labels'].cpu().numpy()
-    # 过滤低置信度检测结果
     keep = scores >= threshold
     return boxes[keep], scores[keep], labels[keep]
-
-def draw_detections(image, boxes, scores, labels):
-    image = image.copy()
-    for box, score, label in zip(boxes, scores, labels):
-        x1, y1, x2, y2 = box.astype(int)
-        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(image, f"{label}: {score:.2f}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-    return image
 
 # ---------------------- 模块3：Mask R-CNN 实例分割 ----------------------
 def run_mask_rcnn(image_tensor, threshold=0.5):
@@ -78,17 +65,8 @@ def run_mask_rcnn(image_tensor, threshold=0.5):
     scores = predictions[0]['scores'].cpu().numpy()
     labels = predictions[0]['labels'].cpu().numpy()
     masks = predictions[0]['masks'].cpu().numpy().squeeze(1)
-    # 过滤低置信度结果
     keep = scores >= threshold
     return boxes[keep], scores[keep], labels[keep], masks[keep]
-
-def draw_masks(image, masks):
-    image = image.copy()
-    for mask in masks:
-        mask = (mask > 0.5).astype(np.uint8) * 255
-        color = np.random.randint(0, 255, 3, dtype=np.uint8)
-        image[mask > 0] = image[mask > 0] * 0.5 + color * 0.5
-    return image
 
 # ---------------------- Streamlit界面 ----------------------
 st.title("🖼️ 计算机视觉三大任务对比平台")
@@ -99,7 +77,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "4. 方法对比与性能分析"
 ])
 
-# ---------------------- 通用上传组件 ----------------------
+# 通用上传组件
 uploaded_file = st.file_uploader("上传一张图片", type=["jpg", "png"], key="main_upload")
 if uploaded_file is not None:
     image = Image.open(uploaded_file).convert("RGB")
@@ -128,15 +106,16 @@ if uploaded_file is not None:
         if st.button("运行目标检测", key="run_det"):
             with st.spinner("检测中..."):
                 boxes, scores, labels = run_faster_rcnn(image_tensor, threshold)
-                # 绘制检测框
-                det_result = draw_detections(image_np.copy(), boxes, scores, labels)
-            fig, axes = plt.subplots(1, 2, figsize=(12,6))
-            axes[0].imshow(image_np)
-            axes[0].set_title("原图")
-            axes[0].axis('off')
-            axes[1].imshow(det_result)
-            axes[1].set_title("Faster R-CNN检测结果")
-            axes[1].axis('off')
+            
+            fig, ax = plt.subplots(figsize=(8,6))
+            ax.imshow(image_np)
+            for box, score, label in zip(boxes, scores, labels):
+                x1, y1, x2, y2 = box
+                rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, fill=False, color='green', linewidth=2)
+                ax.add_patch(rect)
+                ax.text(x1, y1-10, f"{label}: {score:.2f}", color='green', fontsize=10)
+            ax.set_title("Faster R-CNN检测结果")
+            ax.axis('off')
             st.pyplot(fig)
 
     # ---------------------- 模块3：Mask R-CNN 实例分割 ----------------------
@@ -146,14 +125,15 @@ if uploaded_file is not None:
         if st.button("运行实例分割", key="run_mask"):
             with st.spinner("分割中..."):
                 boxes, scores, labels, masks = run_mask_rcnn(image_tensor, threshold_mask)
-                mask_result = draw_masks(image_np.copy(), masks)
-            fig, axes = plt.subplots(1, 2, figsize=(12,6))
-            axes[0].imshow(image_np)
-            axes[0].set_title("原图")
-            axes[0].axis('off')
-            axes[1].imshow(mask_result)
-            axes[1].set_title("Mask R-CNN实例分割结果")
-            axes[1].axis('off')
+            
+            fig, ax = plt.subplots(figsize=(8,6))
+            ax.imshow(image_np)
+            for mask in masks:
+                mask = mask > 0.5
+                color = np.random.rand(3)
+                ax.imshow(mask, cmap=plt.cm.ScalarMappable(cmap='jet'), alpha=0.5)
+            ax.set_title("Mask R-CNN实例分割结果")
+            ax.axis('off')
             st.pyplot(fig)
 
     # ---------------------- 模块4：方法对比 ----------------------
@@ -162,12 +142,9 @@ if uploaded_file is not None:
         st.subheader("1. 结果对比")
         if st.button("一键运行所有方法并对比", key="run_all"):
             with st.spinner("运行中..."):
-                # 同时运行三个模型
                 seg_result = run_fcn(image_tensor)
                 boxes, scores, labels = run_faster_rcnn(image_tensor, 0.5)
-                det_result = draw_detections(image_np.copy(), boxes, scores, labels)
                 boxes_mask, scores_mask, labels_mask, masks = run_mask_rcnn(image_tensor, 0.5)
-                mask_result = draw_masks(image_np.copy(), masks)
             
             fig, axes = plt.subplots(1, 4, figsize=(20,5))
             axes[0].imshow(image_np)
@@ -176,10 +153,17 @@ if uploaded_file is not None:
             axes[1].imshow(seg_result)
             axes[1].set_title("FCN语义分割")
             axes[1].axis('off')
-            axes[2].imshow(det_result)
+            axes[2].imshow(image_np)
+            for box, score, label in zip(boxes, scores, labels):
+                x1, y1, x2, y2 = box
+                rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, fill=False, color='green', linewidth=2)
+                axes[2].add_patch(rect)
             axes[2].set_title("Faster R-CNN目标检测")
             axes[2].axis('off')
-            axes[3].imshow(mask_result)
+            axes[3].imshow(image_np)
+            for mask in masks:
+                mask = mask > 0.5
+                axes[3].imshow(mask, cmap=plt.cm.ScalarMappable(cmap='jet'), alpha=0.5)
             axes[3].set_title("Mask R-CNN实例分割")
             axes[3].axis('off')
             st.pyplot(fig)
